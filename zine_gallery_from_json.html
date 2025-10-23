@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Zine Gallery (JSON + auto description)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { --card-w: 260px; }
+    body { margin: 24px; font-family: system-ui, sans-serif; background: #f6f6f6; color: #222; }
+    h1 { font-size: 1.25rem; margin: 0 0 1rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--card-w), 1fr)); gap: 1rem; }
+    .card { display: grid; grid-template-rows: auto auto auto; background: #fff; border-radius: 12px; box-shadow: 0 3px 10px rgba(0,0,0,.12); overflow: hidden; text-decoration: none; color: inherit; }
+    .thumb-wrap { position: relative; width: 100%; aspect-ratio: 5/7; overflow: hidden; background: #e3e3e3; }
+    .meta { padding: .7rem .9rem .4rem; display: grid; gap: .25rem; }
+    .title { font-weight: 700; font-size: 1rem; line-height: 1.2; text-align: center; }
+    .url   { font-size: .75rem; color: #666; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .desc  { padding: 0 .9rem .9rem; font-size: .85rem; color:#333; }
+    .error { color:#b00020; font-size:.8rem; padding:.35rem .9rem .9rem; display:none; }
+    .preview-host { position:absolute; inset:0; display:block; pointer-events:none; }
+  </style>
+</head>
+<body>
+  <h1>Zine Gallery</h1>
+  <p>Put your zines inside a <code>zines/</code> folder. Run <code>python make_zines_json.py</code>, then refresh.</p>
+  <div class="grid" id="gallery"></div>
+
+  <script type="module">
+    async function loadZines() {
+      const res = await fetch('zines.json', { cache: 'no-store' });
+      if (!res.ok) throw new Error('Missing zines.json. Run "python make_zines_json.py".');
+      return await res.json();
+    }
+
+    async function fetchText(url) {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + url);
+      return await r.text();
+    }
+
+    const zineCss = await fetchText('zine.css').catch(_ => '');
+
+    function createPreview(host, zineUrl, errEl) {
+      const root = host.attachShadow({ mode: 'open' });
+
+      const style = document.createElement('style');
+      style.textContent = `
+${'__INLINE_ZCSS__'}
+
+        :host { all: initial; contain: strict; display:block; position:absolute; inset:0; }
+        .zine { display:block !important; margin:0 !important; padding:0 !important; gap:0 !important; }
+        .zine > * { box-shadow:none !important; border-radius:0 !important; }
+        .fit { position:absolute; inset:0; display:grid; place-items:center; overflow:hidden; }
+        .shell { transform-origin: top left; will-change: transform; }
+		.zine::before {content: none !important; display: none !important; }
+      `;
+      root.appendChild(style);
+
+      const fit = document.createElement('div');
+      fit.className = 'fit';
+      root.appendChild(fit);
+
+      fetchText(zineUrl).then(html => {
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+		attachZineHeadResources(root, doc, zineUrl); // <-- loads the zine’s fonts/CSS into the shadow
+        const first = doc.querySelector('main.zine > article');
+        if (!first) throw new Error('No <article> found');
+        const container = document.createElement('div');
+        container.className = 'zine';
+        container.appendChild(first.cloneNode(true));
+        const shell = document.createElement('div');
+        shell.className = 'shell';
+        shell.appendChild(container);
+        fit.appendChild(shell);
+
+        const MM_TO_PX = 96/25.4;
+        const fallbackW = 75 * MM_TO_PX;
+        const fallbackH = 105 * MM_TO_PX;
+
+        let tries = 0;
+        const tick = () => {
+          tries++;
+          const art = root.querySelector('.zine > article');
+          if (!art) return;
+          const rect = art.getBoundingClientRect();
+          let w = rect.width, h = rect.height;
+          if ((w === 0 || h === 0) && tries < 30) {
+            requestAnimationFrame(tick);
+            return;
+          }
+          if (w === 0 || h === 0) { w = fallbackW; h = fallbackH; }
+          const hostRect = host.getBoundingClientRect();
+          const scale = Math.min(hostRect.width / w, hostRect.height / h);
+          shell.style.width = w + 'px';
+          shell.style.height = h + 'px';
+          shell.style.transform = `scale(${scale})`;
+        };
+        requestAnimationFrame(tick);
+      }).catch(e => {
+        errEl.style.display = 'block';
+        errEl.textContent = 'Preview error: ' + e.message;
+      });
+    }
+
+	// Resolve relative URLs against the zine HTML file (so font URLs work)
+	function resolveUrl(rel, base) {
+	  try { return new URL(rel, new URL(base, location.href)).toString(); }
+	  catch { return rel; }
+	}
+
+	// Rewrite url(...) in inline <style> blocks so relative paths resolve
+	function rewriteCssUrls(cssText, baseUrl) {
+	  return cssText.replace(/url\(([^)]+)\)/g, (m, p1) => {
+		let raw = p1.trim().replace(/^['"]|['"]$/g, '');
+		if (/^data:|^https?:|^blob:/.test(raw)) return `url(${raw})`;
+		return `url('${resolveUrl(raw, baseUrl)}')`;
+	  });
+	}
+
+	// Import the zine’s own <link rel="stylesheet"> and <style> (fonts/theme)
+	// into the Shadow DOM so @font-face rules apply inside the preview.
+	function attachZineHeadResources(shadowRoot, doc, baseUrl) {
+	  // CSS files (includes Google Fonts or your theme CSS)
+	  doc.querySelectorAll('link[rel="stylesheet"]').forEach(link => {
+		const href = link.getAttribute('href');
+		if (!href) return;
+		const l = document.createElement('link');
+		l.rel = 'stylesheet';
+		l.href = resolveUrl(href, baseUrl);
+		shadowRoot.appendChild(l);
+	  });
+
+	// Inline <style> blocks (fix relative url(...) inside them)
+		doc.querySelectorAll('style').forEach(s => {          // <- was 'head style'
+		  const st = document.createElement('style');
+		  st.textContent = rewriteCssUrls(s.textContent || '', baseUrl);
+		  shadowRoot.appendChild(st);
+		});
+
+
+	  // (Optional) keep preconnects for Google Fonts fast
+	  doc.querySelectorAll('link[rel="preconnect"]').forEach(link => {
+		const href = link.getAttribute('href');
+		if (!href) return;
+		const l = document.createElement('link');
+		l.rel = 'preconnect';
+		l.href = href;
+		shadowRoot.appendChild(l);
+	  });
+	}
+
+
+
+    const gallery = document.getElementById('gallery');
+    const ZINES = await loadZines();
+
+    for (const z of ZINES) {
+      const card = document.createElement('a');
+      card.className = 'card';
+      card.href = z.url;
+      card.target = '_blank';
+
+      const wrap = document.createElement('div');
+      wrap.className = 'thumb-wrap';
+
+      const host = document.createElement('div');
+      host.className = 'preview-host';
+      wrap.appendChild(host);
+
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.innerHTML = `
+        <div class="title">${(z.title || z.url).replace(/</g,'&lt;')}</div>
+        <div class="url" visibility: hidden>${z.url.replace(/</g,'&lt;')}</div>
+      `;
+
+      const desc = document.createElement('div');
+      desc.className = 'desc';
+      desc.textContent = z.description || "";
+
+      const err = document.createElement('div');
+      err.className = 'error';
+
+      card.appendChild(wrap);
+      card.appendChild(meta);
+      if (z.description) card.appendChild(desc);
+      card.appendChild(err);
+      gallery.appendChild(card);
+
+      // Inline CSS into the shadow style
+      const css = zineCss.replace('`','\\`');
+      createPreview(host, z.url, err);
+      host.shadowRoot.querySelector('style').textContent = host.shadowRoot.querySelector('style').textContent.replace('__INLINE_ZCSS__', css);
+    }
+  </script>
+</body>
+</html>
